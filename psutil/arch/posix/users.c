@@ -4,47 +4,31 @@
  * found in the LICENSE file.
  */
 
-#if !defined(PSUTIL_OPENBSD) && !defined(PSUTIL_AIX)
+#include "../../arch/all/init.h"
 
+#ifdef PSUTIL_HAS_POSIX_USERS
 #include <Python.h>
 #include <string.h>
 
-#if defined(PSUTIL_LINUX)
-    #include <utmp.h>
-#else
-    #include <utmpx.h>
-#endif
+#include <utmpx.h>
 
-#include "../../arch/all/init.h"
 
 
 static void
 setup() {
-    #if defined(PSUTIL_LINUX)
-        setutent();
-    #else
-        setutxent();
-    #endif
+    setutxent();
 }
 
 
 static void
 teardown() {
-    #if defined(PSUTIL_LINUX)
-        endutent();
-    #else
-        endutxent();
-    #endif
+    endutxent();
 }
 
 
 PyObject *
 psutil_users(PyObject *self, PyObject *args) {
-#if defined(PSUTIL_LINUX)
-    struct utmp *ut;
-#else
     struct utmpx *ut;
-#endif
     PyObject *py_username = NULL;
     PyObject *py_tty = NULL;
     PyObject *py_hostname = NULL;
@@ -54,13 +38,10 @@ psutil_users(PyObject *self, PyObject *args) {
     if (py_retlist == NULL)
         return NULL;
 
+    UTXENT_MUTEX_LOCK();
     setup();
 
-#if defined(PSUTIL_LINUX)
-    while ((ut = getutent()) != NULL) {
-#else
     while ((ut = getutxent()) != NULL) {
-#endif
         if (ut->ut_type != USER_PROCESS)
             continue;
         py_tuple = NULL;
@@ -99,10 +80,12 @@ psutil_users(PyObject *self, PyObject *args) {
     }
 
     teardown();
+    UTXENT_MUTEX_UNLOCK();
     return py_retlist;
 
 error:
     teardown();
+    UTXENT_MUTEX_UNLOCK();
     Py_XDECREF(py_username);
     Py_XDECREF(py_tty);
     Py_XDECREF(py_hostname);
@@ -110,4 +93,4 @@ error:
     Py_DECREF(py_retlist);
     return NULL;
 }
-#endif  // !defined(PLATFORMS…)
+#endif  // PSUTIL_HAS_POSIX_USERS

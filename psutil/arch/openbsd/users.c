@@ -1,5 +1,15 @@
+/*
+ * Copyright (c) 2009, Giampaolo Rodola'.
+ * All rights reserved.
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
 #include <Python.h>
 #include <utmp.h>
+
+#include "../../arch/all/init.h"
+
 
 PyObject *
 psutil_users(PyObject *self, PyObject *args) {
@@ -36,7 +46,7 @@ psutil_users(PyObject *self, PyObject *args) {
         if (! py_hostname)
             goto error;
         py_tuple = Py_BuildValue(
-            "(OOOdi)",
+            "(OOOdO)",
             py_username,        // username
             py_tty,             // tty
             py_hostname,        // hostname

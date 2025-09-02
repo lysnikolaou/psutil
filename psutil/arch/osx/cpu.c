@@ -27,12 +27,11 @@ For reference, here's the git history with original implementations:
 #include <sys/vmmeter.h>
 #include <mach/mach.h>
 #if defined(__arm64__) || defined(__aarch64__)
-#include <CoreFoundation/CoreFoundation.h>
-#include <IOKit/IOKitLib.h>
+    #include <CoreFoundation/CoreFoundation.h>
+    #include <IOKit/IOKitLib.h>
 #endif
 
 #include "../../arch/all/init.h"
-#include "../../_psutil_posix.h"
 
 // added in macOS 12
 #ifndef kIOMainPortDefault
@@ -42,9 +41,8 @@ For reference, here's the git history with original implementations:
 PyObject *
 psutil_cpu_count_logical(PyObject *self, PyObject *args) {
     int num;
-    size_t size = sizeof(int);
 
-    if (sysctlbyname("hw.logicalcpu", &num, &size, NULL, 0))
+    if (psutil_sysctlbyname("hw.logicalcpu", &num, sizeof(num)) != 0)
         Py_RETURN_NONE;  // mimic os.cpu_count()
     else
         return Py_BuildValue("i", num);
@@ -54,9 +52,8 @@ psutil_cpu_count_logical(PyObject *self, PyObject *args) {
 PyObject *
 psutil_cpu_count_cores(PyObject *self, PyObject *args) {
     int num;
-    size_t size = sizeof(int);
 
-    if (sysctlbyname("hw.physicalcpu", &num, &size, NULL, 0))
+    if (psutil_sysctlbyname("hw.physicalcpu", &num, sizeof(num)) != 0)
         Py_RETURN_NONE;  // mimic os.cpu_count()
     else
         return Py_BuildValue("i", num);
@@ -103,7 +100,7 @@ psutil_cpu_stats(PyObject *self, PyObject *args) {
     kern_return_t ret;
     mach_msg_type_number_t count;
     mach_port_t mport;
-    struct vmmeter vm32;
+    struct vmmeter vmstat;
 
     mport = mach_host_self();
     if (mport == MACH_PORT_NULL) {
@@ -113,7 +110,7 @@ psutil_cpu_stats(PyObject *self, PyObject *args) {
     }
 
     count = HOST_VM_INFO_COUNT;
-    ret = host_statistics(mport, HOST_VM_INFO, (host_info_t)&vm32, &count);
+    ret = host_statistics(mport, HOST_VM_INFO, (host_info_t)&vmstat, &count);
     if (ret != KERN_SUCCESS) {
         mach_port_deallocate(mach_task_self(), mport);
         PyErr_Format(
@@ -126,76 +123,100 @@ psutil_cpu_stats(PyObject *self, PyObject *args) {
     mach_port_deallocate(mach_task_self(), mport);
     return Py_BuildValue(
         "IIIII",
-        vm32.v_swtch,  // ctx switches
-        vm32.v_intr,  // interrupts
-        vm32.v_soft,  // software interrupts
-        vm32.v_syscall,  // syscalls
-        vm32.v_trap  // traps
+        vmstat.v_swtch,  // context switches
+        vmstat.v_intr,   // interrupts
+        vmstat.v_soft,   // software interrupts
+#if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) \
+    && __MAC_OS_X_VERSION_MIN_REQUIRED__ >= 120000
+        0,
+#else
+        vmstat.v_syscall,  // system calls (if available)
+#endif
+        vmstat.v_trap     // traps
     );
 }
 
+
 #if defined(__arm64__) || defined(__aarch64__)
-PyObject *
-psutil_cpu_freq(PyObject *self, PyObject *args) {
+
+// Helper to locate the 'pmgr' entry in AppleARMIODevice. Returns 0 on
+// failure, nonzero on success, and stores the found entry in
+// *out_entry. Caller is responsible for IOObjectRelease(*out_entry).
+// Needed because on GitHub CI sometimes (but not all the times)
+// "AppleARMIODevice" is not available.
+static int
+psutil_find_pmgr_entry(io_registry_entry_t *out_entry) {
+
     kern_return_t status;
     io_iterator_t iter = 0;
     io_registry_entry_t entry = 0;
-    CFTypeRef pCoreRef = NULL;
-    CFTypeRef eCoreRef = NULL;
     CFDictionaryRef matching;
-    size_t pCoreLength;
     io_name_t name;
+    int found = 0;
 
-    uint32_t pMin = 0;
-    uint32_t eMin = 0;
-    uint32_t min = 0;
-    uint32_t max = 0;
-    uint32_t curr = 0;
+    *out_entry = 0;
 
-    // Get matching service for Apple ARM I/O device.
     matching = IOServiceMatching("AppleARMIODevice");
-    if (matching == NULL) {
-        return PyErr_Format(
-            PyExc_RuntimeError,
-            "IOServiceMatching failed: 'AppleARMIODevice' not found"
-        );
-    }
+    if (matching == NULL)
+        return 0;
 
-    // IOServiceGetMatchingServices consumes matching; do NOT CFRelease it.
     status = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter);
-    if (status != KERN_SUCCESS) {
-        PyErr_Format(
-            PyExc_RuntimeError, "IOServiceGetMatchingServices call failed"
-        );
-        goto error;
-    }
+    if (status != KERN_SUCCESS)
+        return 0;
 
-    // Find the 'pmgr' entry.
     while ((entry = IOIteratorNext(iter)) != 0) {
         status = IORegistryEntryGetName(entry, name);
         if (status == KERN_SUCCESS && strcmp(name, "pmgr") == 0) {
+            found = 1;
             break;
         }
         IOObjectRelease(entry);
-        entry = 0;
     }
 
-    if (entry == 0) {
-        PyErr_Format(
+    IOObjectRelease(iter);
+
+    if (found) {
+        *out_entry = entry;  // caller must release
+        return 1;
+    }
+
+    return 0;
+}
+
+// Python wrapper: return True/False.
+PyObject *
+psutil_has_cpu_freq(PyObject *self, PyObject *args) {
+    io_registry_entry_t entry = 0;
+    int ok = psutil_find_pmgr_entry(&entry);
+    if (entry != 0)
+        IOObjectRelease(entry);
+    if (ok)
+        Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+
+PyObject *
+psutil_cpu_freq(PyObject *self, PyObject *args) {
+    io_registry_entry_t entry = 0;
+    CFTypeRef pCoreRef = NULL;
+    CFTypeRef eCoreRef = NULL;
+    size_t pCoreLength;
+    uint32_t pMin = 0, eMin = 0, min = 0, max = 0, curr = 0;
+
+    if (!psutil_find_pmgr_entry(&entry)) {
+        return PyErr_Format(
             PyExc_RuntimeError,
             "'pmgr' entry was not found in AppleARMIODevice service"
         );
-        goto error;
     }
 
-    // Get performance and efficiency core data.
     pCoreRef = IORegistryEntryCreateCFProperty(
         entry, CFSTR("voltage-states5-sram"), kCFAllocatorDefault, 0
     );
     if (pCoreRef == NULL ||
             CFGetTypeID(pCoreRef) != CFDataGetTypeID() ||
-            CFDataGetLength(pCoreRef) < 8)
-    {
+            CFDataGetLength(pCoreRef) < 8) {
         PyErr_SetString(
             PyExc_RuntimeError,
             "'voltage-states5-sram' is missing or invalid"
@@ -208,8 +229,7 @@ psutil_cpu_freq(PyObject *self, PyObject *args) {
     );
     if (eCoreRef == NULL ||
             CFGetTypeID(eCoreRef) != CFDataGetTypeID() ||
-            CFDataGetLength(eCoreRef) < 4)
-    {
+            CFDataGetLength(eCoreRef) < 4) {
         PyErr_SetString(
             PyExc_RuntimeError,
             "'voltage-states1-sram' is missing or invalid"
@@ -217,7 +237,6 @@ psutil_cpu_freq(PyObject *self, PyObject *args) {
         goto error;
     }
 
-    // Extract values safely.
     pCoreLength = CFDataGetLength(pCoreRef);
     CFDataGetBytes(pCoreRef, CFRangeMake(0, 4), (UInt8 *)&pMin);
     CFDataGetBytes(eCoreRef, CFRangeMake(0, 4), (UInt8 *)&eMin);
@@ -232,8 +251,6 @@ psutil_cpu_freq(PyObject *self, PyObject *args) {
         CFRelease(eCoreRef);
     if (entry)
         IOObjectRelease(entry);
-    if (iter)
-        IOObjectRelease(iter);
 
     return Py_BuildValue(
         "KKK",
@@ -243,38 +260,43 @@ psutil_cpu_freq(PyObject *self, PyObject *args) {
     );
 
 error:
-    if (pCoreRef != NULL)
+    if (pCoreRef)
         CFRelease(pCoreRef);
-    if (eCoreRef != NULL)
+    if (eCoreRef)
         CFRelease(eCoreRef);
-    if (iter != 0)
-        IOObjectRelease(iter);
-    if (entry != 0)
+    if (entry)
         IOObjectRelease(entry);
     return NULL;
 }
-#else
+#else  // not ARM64 / ARCH64
+PyObject *
+psutil_has_cpu_freq(PyObject *self, PyObject *args) {
+    Py_RETURN_TRUE;
+}
+
 PyObject *
 psutil_cpu_freq(PyObject *self, PyObject *args) {
     unsigned int curr;
-    int64_t min = 0;
-    int64_t max = 0;
+    int64_t min;
+    int64_t max;
     int mib[2];
-    size_t len = sizeof(curr);
-    size_t size = sizeof(min);
 
     // also available as "hw.cpufrequency" but it's deprecated
     mib[0] = CTL_HW;
     mib[1] = HW_CPU_FREQ;
 
-    if (sysctl(mib, 2, &curr, &len, NULL, 0) < 0)
+    if (psutil_sysctl(mib, 2, &curr, sizeof(curr)) < 0)
         return psutil_PyErr_SetFromOSErrnoWithSyscall("sysctl(HW_CPU_FREQ)");
 
-    if (sysctlbyname("hw.cpufrequency_min", &min, &size, NULL, 0))
-        psutil_debug("sysctl('hw.cpufrequency_min') failed (set to 0)");
+    if (psutil_sysctlbyname("hw.cpufrequency_min", &min, sizeof(min)) != 0) {
+        min = 0;
+        psutil_debug("sysctlbyname('hw.cpufrequency_min') failed (set to 0)");
+    }
 
-    if (sysctlbyname("hw.cpufrequency_max", &max, &size, NULL, 0))
-        psutil_debug("sysctl('hw.cpufrequency_min') failed (set to 0)");
+    if (psutil_sysctlbyname("hw.cpufrequency_max", &max, sizeof(max)) != 0) {
+        max = 0;
+        psutil_debug("sysctlbyname('hw.cpufrequency_max') failed (set to 0)");
+    }
 
     return Py_BuildValue(
         "KKK",
@@ -288,7 +310,7 @@ PyObject *
 psutil_per_cpu_times(PyObject *self, PyObject *args) {
     natural_t cpu_count;
     natural_t i;
-    processor_info_array_t info_array;
+    processor_info_array_t info_array = NULL;
     mach_msg_type_number_t info_count;
     kern_return_t error;
     processor_cpu_load_info_data_t *cpu_load_info = NULL;
@@ -339,7 +361,7 @@ psutil_per_cpu_times(PyObject *self, PyObject *args) {
     }
 
     ret = vm_deallocate(mach_task_self(), (vm_address_t)info_array,
-                        info_count * sizeof(int));
+                        info_count * sizeof(integer_t));
     if (ret != KERN_SUCCESS)
         PyErr_WarnEx(PyExc_RuntimeWarning, "vm_deallocate() failed", 2);
     return py_retlist;
@@ -347,9 +369,9 @@ psutil_per_cpu_times(PyObject *self, PyObject *args) {
 error:
     Py_XDECREF(py_cputime);
     Py_DECREF(py_retlist);
-    if (cpu_load_info != NULL) {
+    if (info_array != NULL) {
         ret = vm_deallocate(mach_task_self(), (vm_address_t)info_array,
-                            info_count * sizeof(int));
+                            info_count * sizeof(integer_t));
         if (ret != KERN_SUCCESS)
             PyErr_WarnEx(PyExc_RuntimeWarning, "vm_deallocate() failed", 2);
     }
